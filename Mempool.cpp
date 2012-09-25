@@ -1,81 +1,91 @@
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <cassert>
 #include "Mempool.h"
 
-void Mempool::init_mempool(size_t size)
+struct Mempool::_chunk_obj* Mempool::_free_link_list[];
+struct Mempool::_chunk_obj* Mempool::_large_free_list = NULL;
+unsigned char* Mempool::_start = NULL;
+unsigned char* Mempool::_start_free = NULL;
+unsigned char* Mempool::_end_free = NULL;
+
+int Mempool::init_pool(size_t size)
 {
-    for ( int i = 0; i < LINK_LIST_SIZE; ++i ) {
+    for ( int i = 0; i < _LINK_LIST_SIZE; ++i ) {
         _free_link_list[i] = NULL;
     }
     _large_free_list = NULL;
 
     unsigned char* pointer;
-    uint64_t align_size = _round_up(size);
-    try {
-        pointer = (unsigned char*) malloc(align_size);
-    }
-    catch ( const std::exception& e) {
-        printf("%s\n", e.what());
+    pointer = (unsigned char*) malloc(size);
+    if ( pointer == NULL ) {
+        printf("mempool init fail\n");
         return -1;
     }
-    memset(pointer, 0, align_size);
+    memset(pointer, 0, size);
+    _start = pointer;
     _start_free = pointer;
-    _end_free = pointer + align_size;
+    _end_free = pointer + size;
+    return 0;
 }
 
-
-uint64_t Mempool::_round_up(uint64_t size, int align)
+void Mempool::destroy_pool()
 {
-    assert(align > 0);
-    uint64_t res = size + (align - 1) & ~(align - 1);
-    return res == 0 ? align : res;
+    if ( _start_free != NULL ) {
+        free(_start);
+    }
 }
 
-int Mempool::_freelist_index(uint64_t size)
+size_t Mempool::_round_up(size_t size)
 {
-    uint64_t align_size = _round_up(size, _ALIGN_SIZE);
-    return align_size / _ALIGN_SIZE - 1;
+    size_t res = size + (_MIN_ALLOC_SIZE - 1) & ~(_MIN_ALLOC_SIZE - 1);
+    return res == 0 ? _MIN_ALLOC_SIZE : res;
 }
 
-struct _chunk_obj* Mempool::_reallocate(size_t size)
+int Mempool::_freelist_index(size_t size)
 {
-    uint64_t align_size = _round_up(size, _ALIGN_SIZE);
-    uint64_t real_size = align_size + sizeof(uint64_t);
+    size_t align_size = _round_up(size);
+    return align_size / _MIN_ALLOC_SIZE - 1;
+}
+
+int Mempool::_reallocate(size_t size, int default_cnt)
+{
+    size_t align_size = _round_up(size);
+    size_t real_size = align_size + sizeof(size_t);
     int cnt = (_end_free - _start_free) / real_size;
-    cnt = cnt > _REALLOCATE_CHUNK_CNT ? _REALLOCATE_CHUNK_CNT : cnt;
+    cnt = cnt > default_cnt ? default_cnt : cnt;
+    // 空间不够了
+    if ( cnt <= 0 ) {
+        return -1;
+    }
+    // 分配若干个新的chunk
     unsigned char* start = _start_free;
-    
-    struct _chunk_obj* chunk = NULL;
     for ( int i = 0; i < cnt; ++i )
     {
-        chunk = reinterpret_cast<struct _chunk_obj*>
-                    (start + sizeof(uint64_t));
+        struct _chunk_obj* chunk =
+            reinterpret_cast<struct _chunk_obj*>
+                (start + sizeof(size_t));
         start += real_size;
         chunk->__next =
             reinterpret_cast<struct _chunk_obj*>
-                (start + sizeof(uint64_t));
+                (start + sizeof(size_t));
+        *(reinterpret_cast<size_t*>(chunk) - 1) = align_size;
     }
-    chunk->__next = NULL;
-
-    struct _chunk_obj* first =
+    // 将最后一个chunk->__next置为NULL
+    struct _chunk_obj* last_chunk =
         reinterpret_cast<struct _chunk_obj*>
-            (_start_free + sizeof(uint64_t));
-    _start_free += (cnt * real_size);
-    return cnt == 0 ? NULL : first;
-}
-
-struct _chunk_obj* Mempool::_find_large_chunk(size_t size)
-{
-    uint64_t align_size = _round_up(size, _ALIGN_SIZE_LARGE);
-    struct _chunk_obj* chunk = _large_free_list;
-    while ( chunk != NULL )
-    {
-        uint64_t chunk_size =
-            *(reinterpret_cast<uint64_t*>(chunk) - 1);
-        if ( chunk_size == align_size ) {
-            return chunk;
-        }
-        chunk = chunk->__next;
-    }
-    return NULL;
+            (start - real_size + sizeof(size_t));
+    last_chunk->__next = NULL;
+    // 第一块chunk为_free__link_list
+    int index = _freelist_index(size);
+    assert(index >= 0 && index < _LINK_LIST_SIZE);
+    _free_link_list[index] =
+        reinterpret_cast<struct _chunk_obj*>
+            (_start_free + sizeof(size_t));
+    // 更新_start_free
+    _start_free = start;
+    return 0;
 }
 
 void* Mempool::allocate(size_t size)
@@ -83,67 +93,98 @@ void* Mempool::allocate(size_t size)
     if ( size <= 0 ) {
         return NULL;
     }
-
+    // 小块内存在自由链表上找
     if ( size <= _MAX_ALLOC_SIZE )
     {
         int index = _freelist_index(size);
-        if ( _free_link_list[index] == NULL )
-        {
-            struct _chunk_obj* new_chunk = _reallocate(size);
-            if ( new_chunk == NULL ) {
+        assert(index >= 0 && index < _LINK_LIST_SIZE);
+        if ( _free_link_list[index] == NULL ) {
+            // 自由链表为空，则重新分配一些chunk加在链表上
+            // 默认分配的个数是20个
+            if ( _reallocate(size) != 0 ) {
                 return NULL;
             }
-            _freelist_link_list[index] = new_chunk;
         }
-
         struct _chunk_obj* ret = _free_link_list[index];
-        _free_link_list[index] = ret->next;
+        _free_link_list[index] = ret->__next;
         return reinterpret_cast<void*>(ret);
     }
-    else
+    // 分配大块内存 
+    size_t align_size = _round_up(size);
+    struct _chunk_obj* chunk = _large_free_list;
+    // 先在大块内存链表上查找一块合适的
+    while ( chunk != NULL )
     {
-        struct _chunk_obj* ret = _find_large_chunk(size);
-        if ( ret != NULL ) {
-            _large_free_list = ret->__next;
-            return reinterpret_cast<void*>(ret);
+        if ( *(reinterpret_cast<size_t*>(chunk) - 1) == align_size ) {
+            _large_free_list = chunk->__next;
+            return chunk;
         }
-
-        uint64_t remainder_size = _end_free - _start_free;
-        uint64_t align_size = _round_up(size, _ALIGN_SIZE_LARGE);
-        if ( remainder_size <
-                align_size + sizeof(uint64_t) ) {
-            return NULL;
-        }
-        *reinterpret_cast<uint64_t*>(_start_free) = align_size;
-        ret = reinterpret_cast<struct _chunk_obj*>
-                (_start_free + sizeof(uint64_t));
-        _start_free += (align_size + sizeof(uint64_t));
-        return reinterpret_cast<void*>(ret);
+        chunk = chunk->__next;
     }
+    // 找不到就重新分配一块
+    if ( _end_free - _start_free >=
+            static_cast<int>(align_size + sizeof(size_t)) )
+    {
+        struct _chunk_obj* chunk = 
+            reinterpret_cast<struct _chunk_obj*>
+                (_start_free + sizeof(size_t));
+        *(reinterpret_cast<size_t*>(chunk) - 1) = align_size;
+        _start_free += align_size + sizeof(size_t);
+        return reinterpret_cast<void*>(chunk);
+    }
+    return NULL;
 }
 
-void Mempool::dellocate(void* pointer)
+void Mempool::deallocate(void* pointer)
 {
     if ( pointer == NULL ) {
         return;
     }
-    uint64_t size = *(reinterpret_cast<uint64_t*>(pointer) - 1);
-    assert(size >= _ALIGN_SIZE);
-    if ( size <= _MAX_ALLOC_SIZE )
+    struct _chunk_obj* chunk =
+        reinterpret_cast<struct _chunk_obj*>(pointer);
+    size_t align_size =
+        *(reinterpret_cast<size_t*>(pointer) - 1);
+    if ( align_size <= _MAX_ALLOC_SIZE )
     {
-        int index = size / _ALIGN_SIZE - 1;
-        struct _chunk_obj* chunk =
-            reinterpret_cast<struct _chunk_obj*>(pointer);
+        int index = align_size / _MIN_ALLOC_SIZE - 1;
+        assert(index >= 0 && index < _LINK_LIST_SIZE);
         chunk->__next = _free_link_list[index];
         _free_link_list[index] = chunk;
     }
     else
     {
-        struct _chunk_obj* chunk =
-            reinterpret_cast<struct _chunk_obj*>(pointer);
         chunk->__next = _large_free_list;
         _large_free_list = chunk;
     }
+}
+
+void Mempool::dump()
+{
+    printf("-----------dump-----------\n");
+    printf("freelist_link:\n");
+    for ( int i = 0; i < _LINK_LIST_SIZE; ++i )
+    {
+        int list_length = 0;
+        struct _chunk_obj* chunk = _free_link_list[i];
+        while ( chunk != NULL ) {
+            ++list_length;
+            chunk = chunk->__next;
+        }
+        if ( list_length != 0 ) {
+            printf("freelist_link[%d] size=%d\n",
+                    (i + 1) * _MIN_ALLOC_SIZE, list_length);
+        }
+    }
+    printf("large_free_list:\n");
+    struct _chunk_obj* chunk = _large_free_list;
+    while ( chunk != NULL )
+    {
+        size_t align_size = *(reinterpret_cast<size_t*>(chunk) - 1);
+        printf("chunk size = %lu -->\n", align_size);
+        chunk = chunk->__next;
+    }
+    printf("_start_free = %p, _end_free = %p, free_size = %ld\n",
+            _start_free, _end_free, _end_free - _start_free);
 }
 
 
