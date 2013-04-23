@@ -10,26 +10,26 @@
 
 class Mempool
 {
-    struct _chunk_obj
+    struct _ChunkObj
     {
-        struct _chunk_obj* __next;
+        struct _ChunkObj* __next;
         unsigned char chunk[];
     };
 public:
-    static int init_pool(size_t size);
-    static void destroy_pool();
-    static void* allocate(size_t size);
-    static void deallocate(void* pointer);
-    static void dump();
+    static int InitPool(size_t size);
+    static void DestroyPool();
+    static void* Allocate(size_t size);
+    static void Deallocate(void* pointer);
+    static void Dump();
 private:
-    static size_t _round_up(size_t size);
-    static int _freelist_index(size_t size);
-    static int _reallocate(size_t size, int default_cnt = 20);
+    static size_t _RoundUp(size_t size);
+    static int _FreelistIndex(size_t size);
+    static int _Reallocate(size_t size, int default_cnt = 20);
 private:
     Mempool();
     ~Mempool();
-    static struct _chunk_obj* _free_link_list[_LINK_LIST_SIZE];
-    static struct _chunk_obj* _large_free_list;
+    static struct _ChunkObj* _free_link_list[_LINK_LIST_SIZE];
+    static struct _ChunkObj* _large_free_list;
     static unsigned char* _start;
     static unsigned char* _start_free;
     static unsigned char* _end_free;
